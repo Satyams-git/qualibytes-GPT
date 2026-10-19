@@ -236,6 +236,7 @@
   <script>
     // Conversation history — ChatGPT style (keeps context)
     let conversationHistory = [];
+    const MAX_HISTORY = 10;
 
     const chatWindow  = document.getElementById('chat-window');
     const userInput   = document.getElementById('user-input');
@@ -325,10 +326,17 @@
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: conversationHistory })
+          // tinyllama has a small context window — send only recent turns
+          body: JSON.stringify({ messages: conversationHistory.slice(-MAX_HISTORY) })
         });
 
-        const data = await response.json();
+        let data;
+        try {
+          data = await response.json();
+        } catch {
+          // e.g. Nginx returned an HTML 502/504 page
+          data = { error: `Server returned ${response.status} ${response.statusText}` };
+        }
         removeTyping();
 
         if (data.error) {

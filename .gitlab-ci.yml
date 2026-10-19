@@ -2,6 +2,10 @@
 #  Qualibytes GPT — GitLab CI/CD Pipeline
 #  File: .gitlab-ci.yml
 #  Stages: build → push → deploy → verify
+#
+#  Runner: shell executor tagged `ec2` (README §8). It runs as the
+#  non-root `gitlab-runner` user, so the jobs do NOT apt-get install —
+#  openssh-client and curl must already be on the runner machine.
 # ============================================================
 
 stages:
@@ -13,97 +17,67 @@ stages:
 variables:
   FRONTEND_IMAGE: $DOCKER_USERNAME/qualibytes-frontend
   BACKEND_IMAGE:  $DOCKER_USERNAME/qualibytes-backend
+  IMAGE_TAG:      $CI_PIPELINE_IID
+  APP_DIR:        qualibytes-gpt
+  SSH_OPTS:       "-o StrictHostKeyChecking=accept-new"
+
+default:
+  tags:
+    - ec2
+
+# Shared SSH setup for deploy + verify
+.ssh-setup: &ssh-setup
+  - eval "$(ssh-agent -s)"
+  - printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+  - mkdir -p ~/.ssh && chmod 700 ~/.ssh
 
 # ── STAGE 1: BUILD ──────────────────────────────────────────
 build-frontend:
   stage: build
-  tags:
-    - ec2
   script:
-    - echo "=== Building Frontend Image ==="
-    - docker build -t $FRONTEND_IMAGE:$CI_PIPELINE_IID ./frontend
-    - docker tag  $FRONTEND_IMAGE:$CI_PIPELINE_IID $FRONTEND_IMAGE:latest
-    - docker images | grep qualibytes
+    - docker build -t "$FRONTEND_IMAGE:$IMAGE_TAG" -t "$FRONTEND_IMAGE:latest" ./frontend
 
 build-backend:
   stage: build
-  tags:
-    - ec2
   script:
-    - echo "=== Building Backend Image ==="
-    - docker build -t $BACKEND_IMAGE:$CI_PIPELINE_IID ./backend
-    - docker tag  $BACKEND_IMAGE:$CI_PIPELINE_IID $BACKEND_IMAGE:latest
+    - docker build -t "$BACKEND_IMAGE:$IMAGE_TAG" -t "$BACKEND_IMAGE:latest" ./backend
 
 # ── STAGE 2: PUSH ───────────────────────────────────────────
 push-images:
   stage: push
-  tags:
-    - ec2
   script:
-    - echo "=== Pushing images to Docker Hub ==="
-    - echo $DOCKER_PASSWORD | docker login -u $DOCKER_USERNAME --password-stdin
-    - docker push $FRONTEND_IMAGE:latest
-    - docker push $FRONTEND_IMAGE:$CI_PIPELINE_IID
-    - docker push $BACKEND_IMAGE:latest
-    - docker push $BACKEND_IMAGE:$CI_PIPELINE_IID
-    - docker logout
-    - echo "Push complete!"
+    - printf '%s' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+    - |
+      for img in "$FRONTEND_IMAGE" "$BACKEND_IMAGE"; do
+        docker push "$img:$IMAGE_TAG"
+        docker push "$img:latest"
+      done
+  after_script:
+    - docker logout || true
 
 # ── STAGE 3: DEPLOY ─────────────────────────────────────────
 deploy-to-ec2:
   stage: deploy
-  tags:
-    - ec2
-  before_script:
-    - apt-get update -qq && apt-get install -y openssh-client
-    - eval $(ssh-agent -s)
-    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
-    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    - ssh-keyscan $APP_SERVER_IP >> ~/.ssh/known_hosts
+  before_script: *ssh-setup
   script:
-    - echo "=== Deploying to App Server ==="
-    - scp docker-compose.yml ubuntu@$APP_SERVER_IP:~/docker-compose.yml
+    - ssh $SSH_OPTS "ubuntu@$APP_SERVER_IP" "mkdir -p ~/$APP_DIR"
+    - scp $SSH_OPTS docker-compose.yml deploy.sh healthcheck.sh "ubuntu@$APP_SERVER_IP:~/$APP_DIR/"
+    # Password goes over stdin — not in argv, env or logs
     - |
-      ssh ubuntu@$APP_SERVER_IP "
-        echo $DOCKER_PASSWORD | docker login -u $DOCKER_USERNAME --password-stdin
-
-        docker-compose pull frontend backend
-        docker-compose up -d --no-deps frontend backend
-
-        if ! docker exec qualibytes-ollama ollama list 2>/dev/null | grep -q tinyllama; then
-          echo 'Pulling tinyllama model...'
-          docker exec qualibytes-ollama ollama pull tinyllama
-        fi
-
-        docker-compose ps
-        docker logout
-      "
+      printf '%s' "$DOCKER_PASSWORD" | ssh $SSH_OPTS "ubuntu@$APP_SERVER_IP" \
+        "chmod +x ~/$APP_DIR/*.sh && DOCKER_USERNAME='$DOCKER_USERNAME' IMAGE_TAG='$IMAGE_TAG' ~/$APP_DIR/deploy.sh"
     - echo "Deployment done! URL: http://$APP_SERVER_IP"
   environment:
     name: production
     url: http://$APP_SERVER_IP
-  only:
-    - main
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
 
 # ── STAGE 4: VERIFY ─────────────────────────────────────────
 health-check:
   stage: verify
-  tags:
-    - ec2
-  before_script:
-    - apt-get update -qq && apt-get install -y openssh-client curl
-    - eval $(ssh-agent -s)
-    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
-    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    - ssh-keyscan $APP_SERVER_IP >> ~/.ssh/known_hosts
+  before_script: *ssh-setup
   script:
-    - echo "=== Running Health Check ==="
-    - |
-      ssh ubuntu@$APP_SERVER_IP "
-        sleep 5
-        curl --retry 5 --retry-delay 3 --fail http://localhost:5000/health \
-          && echo 'Backend: HEALTHY' \
-          || (echo 'Backend: UNHEALTHY' && exit 1)
-      "
-  only:
-    - main
+    - ssh $SSH_OPTS "ubuntu@$APP_SERVER_IP" "~/$APP_DIR/healthcheck.sh"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"

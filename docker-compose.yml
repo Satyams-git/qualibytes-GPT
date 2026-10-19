@@ -1,46 +1,51 @@
-version: "3.8"
-
 # ============================================================
 #  Qualibytes GPT — Docker Compose
 #  Services: frontend (nginx) | backend (flask) | ollama (LLM)
 #  Network : qualibytes-network (all 3 talk to each other)
+#
+#  Local  : `docker compose up -d --build` builds from ./frontend, ./backend
+#  Server : `docker compose pull && docker compose up -d` pulls the images
+#           CI pushed to Docker Hub (needs DOCKER_USERNAME in the env)
 # ============================================================
 
 services:
 
   # ── 1. FRONTEND ──────────────────────────────────────────
   frontend:
+    image: ${DOCKER_USERNAME:-local}/qualibytes-frontend:${IMAGE_TAG:-latest}
     build: ./frontend
     container_name: qualibytes-frontend
     ports:
-      - "80:80"            # Browser hits port 80
+      - "80:80"            # The only port exposed to the internet
     depends_on:
-      - backend            # Backend must start first
+      - backend
     networks:
       - qualibytes-network
     restart: unless-stopped
 
   # ── 2. BACKEND ───────────────────────────────────────────
   backend:
+    image: ${DOCKER_USERNAME:-local}/qualibytes-backend:${IMAGE_TAG:-latest}
     build: ./backend
     container_name: qualibytes-backend
     ports:
-      - "5000:5000"        # Exposed for direct testing
+      - "127.0.0.1:5000:5000"   # Localhost only — for health checks on the server
     environment:
       - OLLAMA_URL=http://ollama:11434   # Container name as hostname
       - MODEL_NAME=tinyllama
     depends_on:
-      - ollama             # Ollama must start first
+      - ollama
     networks:
       - qualibytes-network
     restart: unless-stopped
 
   # ── 3. OLLAMA (LLM ENGINE) ───────────────────────────────
+  # No public port: Ollama has no authentication. Backend reaches it
+  # over the Docker network. For debugging use:
+  #   docker exec qualibytes-ollama ollama list
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.40.6
     container_name: qualibytes-ollama
-    ports:
-      - "11434:11434"      # Exposed for direct testing
     volumes:
       - ollama-data:/root/.ollama   # Model files persist across restarts
     networks:

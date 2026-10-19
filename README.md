@@ -67,7 +67,7 @@ Jenkins / GitLab Runner
   │ Build Frontend & Backend Images │
   │ Push to Docker Hub              │
   │ SSH into App Server             │
-  │ docker-compose pull & up        │
+  │ docker compose pull & up        │
   │ Health Check                    │
   └─────────────────────────────────┘
        │
@@ -90,7 +90,9 @@ qualibytes-gpt/
 │   ├── app.py              ← Flask API
 │   └── requirements.txt    ← Flask, requests, gunicorn
 ├── docker-compose.yml      ← All 3 services + network + volume
-├── setup.sh                ← First-time setup script
+├── setup.sh                ← First-time LOCAL setup (builds from source)
+├── deploy.sh               ← Runs on the App Server: pull images + start (used by CI)
+├── healthcheck.sh          ← Runs on the App Server: post-deploy checks (used by CI)
 ├── Jenkinsfile             ← Jenkins Declarative Pipeline
 ├── .gitlab-ci.yml          ← GitLab CI/CD Pipeline
 ├── .gitignore
@@ -109,7 +111,7 @@ qualibytes-gpt/
 - Ubuntu 22.04 LTS
 - Docker installed
 - Docker Compose installed
-- Ports open: **22, 80, 5000, 11434**
+- Ports open: **22, 80** (5000 and 11434 stay private — see 5.1)
 
 ### Accounts needed:
 - [Docker Hub](https://hub.docker.com) — free account (image storage)
@@ -125,11 +127,14 @@ qualibytes-gpt/
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 22 | TCP | SSH access |
+| 22 | TCP | SSH access (restrict to your IP + the Jenkins server) |
 | 80 | TCP | Web app (frontend) |
-| 5000 | TCP | Backend API |
-| 8080 | TCP | Jenkins (CI server only) |
-| 11434 | TCP | Ollama (optional, for debugging) |
+| 8080 | TCP | Jenkins (Jenkins server only, restrict to your IP) |
+
+> ⚠️ Do **not** open 5000 or 11434. The backend is bound to `127.0.0.1:5000`
+> on the server and Ollama has no published port at all — Ollama has no
+> authentication, so a public 11434 lets anyone use your server's CPU/RAM
+> and fill its disk with models. Test them from the server itself.
 
 ### 5.2 Install Docker on EC2
 
@@ -162,7 +167,7 @@ Use this to test the app before setting up CI/CD.
 ### Step 1 — Clone the repo
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/qualibytes-gpt.git
+git clone https://github.com/Satyams-git/qualibytes-GPT.git qualibytes-gpt
 cd qualibytes-gpt
 ```
 
@@ -174,7 +179,7 @@ chmod +x setup.sh
 ```
 
 This will:
-1. Start all 3 containers
+1. Build the frontend & backend images and start all 3 containers
 2. Wait for Ollama to be ready
 3. Download the tinyllama model (~637MB)
 
@@ -255,6 +260,7 @@ Go to **Manage Jenkins → Plugins → Available** and install:
 - Docker Pipeline Plugin
 - SSH Agent Plugin
 - Pipeline Plugin (usually pre-installed)
+- Timestamper (usually pre-installed)
 
 ### 7.3 Add Credentials
 
@@ -289,12 +295,27 @@ sudo systemctl restart jenkins
 4. Under Pipeline section:
    - Definition: **Pipeline script from SCM**
    - SCM: **Git**
-   - Repository URL: `https://github.com/YOUR-USERNAME/qualibytes-gpt.git`
+   - Repository URL: `https://github.com/Satyams-git/qualibytes-GPT.git`
    - Branch: `*/main`
    - Script Path: `Jenkinsfile`
 5. **Save** → **Build Now**
 
-### 7.7 Add GitHub Webhook (Auto-trigger)
+### 7.7 What the pipeline does
+
+| Stage | What happens |
+|-------|--------------|
+| Build | Builds both images, tagged `:BUILD_NUMBER` and `:latest` |
+| Push | Pushes both tags to Docker Hub |
+| Deploy | Copies `docker-compose.yml`, `deploy.sh`, `healthcheck.sh` to `~/qualibytes-gpt/` on the App Server and runs `deploy.sh` with `IMAGE_TAG=BUILD_NUMBER` |
+| Health Check | Runs `healthcheck.sh` on the App Server (backend, model, frontend, one real chat) |
+
+The Docker Hub password is sent to the server over SSH **stdin**, so it never
+shows up in the build log or the server's process list.
+
+**Rollback:** on the App Server run
+`cd ~/qualibytes-gpt && DOCKER_USERNAME=<you> IMAGE_TAG=<old build number> ./deploy.sh`
+
+### 7.8 Add GitHub Webhook (Auto-trigger)
 
 1. Go to your GitHub repo → **Settings → Webhooks → Add webhook**
 2. Payload URL: `http://JENKINS-IP:8080/github-webhook/`
@@ -324,6 +345,9 @@ git push gitlab main
 # Add GitLab Runner repo
 curl -L "https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh" | sudo bash
 sudo apt install gitlab-runner -y
+
+# The jobs don't install packages (the runner isn't root) — install these once
+sudo apt install -y openssh-client curl
 
 # Add runner to docker group
 sudo usermod -aG docker gitlab-runner
@@ -379,11 +403,17 @@ Go to **GitLab → CI/CD → Pipelines** to watch it run.
 After pipeline runs successfully, verify:
 
 ```bash
+# Run these ON the App Server (5000 is bound to localhost only)
+cd ~/qualibytes-gpt
+
+# 0. Everything at once
+./healthcheck.sh
+
 # 1. All containers running
 docker compose ps
 
 # 2. Backend health check
-curl http://YOUR-EC2-IP:5000/health
+curl http://localhost:5000/health
 # Expected: {"status": "OK", "app": "Qualibytes GPT Backend", "model": "tinyllama"}
 
 # 3. tinyllama is downloaded
@@ -391,7 +421,7 @@ docker exec qualibytes-ollama ollama list
 # Expected: tinyllama listed
 
 # 4. Test a chat API call directly
-curl -X POST http://YOUR-EC2-IP:5000/api/chat \
+curl -X POST http://localhost:5000/api/chat \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Say hello"}]}'
 
@@ -416,7 +446,7 @@ sudo usermod -aG docker gitlab-runner  # For GitLab Runner
 ---
 
 ### ❌ `docker compose: command not found`
-**Cause:** Old Docker Compose v1 installed (uses `docker-compose` with a hyphen).
+**Cause:** Docker Compose v2 plugin is missing. This project uses `docker compose` (with a space) everywhere — the old v1 `docker-compose` binary is not used.
 ```bash
 # Install Docker Compose v2
 sudo apt install docker-compose-v2 -y
@@ -436,7 +466,7 @@ docker compose logs ollama
 docker compose restart ollama
 
 # Wait ~10s then try again
-curl http://localhost:11434
+docker exec qualibytes-ollama ollama list
 ```
 
 ---
